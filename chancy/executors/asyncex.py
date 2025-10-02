@@ -3,7 +3,7 @@ from asyncio import CancelledError
 
 from chancy import Reference
 from chancy.executors.base import Executor
-from chancy.job import QueuedJob, Limit
+from chancy.job import Limit, QueuedJob
 
 
 class AsyncExecutor(Executor):
@@ -46,7 +46,7 @@ class AsyncExecutor(Executor):
 
     async def _job_wrapper(self, job: QueuedJob):
         try:
-            func, kwargs = Executor.get_function_and_kwargs(job)
+            func, kwargs = self.get_function_and_kwargs(job)
             if not asyncio.iscoroutinefunction(func):
                 raise ValueError(
                     f"Function {job.func!r} is not an async function, which is"
