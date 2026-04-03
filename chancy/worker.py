@@ -470,83 +470,6 @@ class Worker:
             j = json.loads(notification.payload)
             await self.hub.emit(j.pop("t"), j)
 
-    async def _flush_updates(self, pending_updates: list[QueuedJob]):
-        """
-        Flush pending job updates to the database.
-
-        On deadlock, retries once before re-raising. This prevents the
-        worker from crashing on transient deadlocks while still surfacing
-        the error for observability.
-        """
-        for attempt in range(2):
-            async with self.chancy.pool.connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cursor:
-                    async with conn.transaction():
-                        try:
-                            await cursor.executemany(
-                                sql.SQL(
-                                    """
-                                    UPDATE
-                                        {jobs}
-                                    SET
-                                        state = %(state)s,
-                                        started_at = %(started_at)s,
-                                        completed_at = %(completed_at)s,
-                                        scheduled_at = %(scheduled_at)s,
-                                        attempts = %(attempts)s,
-                                        errors = %(errors)s,
-                                        meta = %(meta)s,
-                                        max_attempts = %(max_attempts)s
-                                    WHERE
-                                        id = %(id)s
-                                    """
-                                ).format(
-                                    jobs=sql.Identifier(
-                                        f"{self.chancy.prefix}jobs"
-                                    )
-                                ),
-                                [
-                                    {
-                                        "id": update.id,
-                                        "state": update.state.value,
-                                        "started_at": update.started_at,
-                                        "completed_at": update.completed_at,
-                                        "scheduled_at": update.scheduled_at,
-                                        "attempts": update.attempts,
-                                        "errors": Json(update.errors),
-                                        "meta": Json(update.meta),
-                                        "max_attempts": update.max_attempts,
-                                    }
-                                    for update in pending_updates
-                                ],
-                            )
-                            return
-                        except DeadlockDetected:
-                            if attempt == 0:
-                                self.chancy.log.error(
-                                    "Deadlock detected while updating"
-                                    f" {len(pending_updates)} jobs,"
-                                    " retrying once."
-                                )
-                                continue
-
-                            self.chancy.log.exception(
-                                "Deadlock detected while updating"
-                                f" {len(pending_updates)} jobs,"
-                                " retry exhausted."
-                            )
-                            for update in pending_updates:
-                                await self.outgoing.put(update)
-                            raise
-                        except Exception:
-                            self.chancy.log.exception(
-                                "Failed to apply updates to job"
-                                " instances."
-                            )
-                            for update in pending_updates:
-                                await self.outgoing.put(update)
-                            raise
-
     async def _maintain_updates(self):
         """
         Process updates to job instances.
@@ -574,7 +497,82 @@ class Worker:
                 f"Processing {len(pending_updates)} outgoing updates."
             )
 
-            await self._flush_updates(pending_updates)
+            for attempt in range(2):
+                try:
+                    async with self.chancy.pool.connection() as conn:
+                        async with conn.cursor(
+                            row_factory=dict_row
+                        ) as cursor:
+                            async with conn.transaction():
+                                await cursor.executemany(
+                                    sql.SQL(
+                                        """
+                                        UPDATE
+                                            {jobs}
+                                        SET
+                                            state = %(state)s,
+                                            started_at = %(started_at)s,
+                                            completed_at = %(completed_at)s,
+                                            scheduled_at = %(scheduled_at)s,
+                                            attempts = %(attempts)s,
+                                            errors = %(errors)s,
+                                            meta = %(meta)s,
+                                            max_attempts = %(max_attempts)s
+                                        WHERE
+                                            id = %(id)s
+                                        """
+                                    ).format(
+                                        jobs=sql.Identifier(
+                                            f"{self.chancy.prefix}jobs"
+                                        )
+                                    ),
+                                    [
+                                        {
+                                            "id": update.id,
+                                            "state": update.state.value,
+                                            "started_at": update.started_at,
+                                            "completed_at": (
+                                                update.completed_at
+                                            ),
+                                            "scheduled_at": (
+                                                update.scheduled_at
+                                            ),
+                                            "attempts": update.attempts,
+                                            "errors": Json(update.errors),
+                                            "meta": Json(update.meta),
+                                            "max_attempts": (
+                                                update.max_attempts
+                                            ),
+                                        }
+                                        for update in pending_updates
+                                    ],
+                                )
+                    break
+                except DeadlockDetected:
+                    if attempt < 1:
+                        self.chancy.log.error(
+                            "Deadlock detected while updating"
+                            f" {len(pending_updates)} jobs,"
+                            " retrying once."
+                        )
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    self.chancy.log.exception(
+                        "Deadlock detected while updating"
+                        f" {len(pending_updates)} jobs,"
+                        " retry exhausted."
+                    )
+                    for update in pending_updates:
+                        await self.outgoing.put(update)
+                    raise
+                except Exception:
+                    self.chancy.log.exception(
+                        "Failed to apply updates to job instances."
+                    )
+                    for update in pending_updates:
+                        await self.outgoing.put(update)
+                    raise
 
             for update in pending_updates:
                 for plugin in self.chancy.plugins.values():
