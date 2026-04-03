@@ -14,6 +14,7 @@ from collections import defaultdict
 
 from psycopg import sql
 from psycopg import AsyncConnection
+from psycopg.errors import DeadlockDetected
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
@@ -469,33 +470,15 @@ class Worker:
             j = json.loads(notification.payload)
             await self.hub.emit(j.pop("t"), j)
 
-    async def _maintain_updates(self):
+    async def _flush_updates(self, pending_updates: list[QueuedJob]):
         """
-        Process updates to job instances.
+        Flush pending job updates to the database.
 
-        We maintain a queue of updates to job instances, and process them in
-        batches to significantly reduce the number of overall transactions that
-        need to be made, at the cost of potentially losing some updates if the
-        worker is stopped unexpectedly. The frequency of these updates can be
-        controlled by setting the `send_outgoing_interval` attribute on the
-        worker.
+        On deadlock, retries once before re-raising. This prevents the
+        worker from crashing on transient deadlocks while still surfacing
+        the error for observability.
         """
-        while True:
-            if self.outgoing.empty():
-                await asyncio.sleep(self.send_outgoing_interval)
-                continue
-
-            pending_updates = []
-            while len(pending_updates) < 1000:
-                try:
-                    pending_updates.append(self.outgoing.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-
-            self.chancy.log.debug(
-                f"Processing {len(pending_updates)} outgoing updates."
-            )
-
+        for attempt in range(2):
             async with self.chancy.pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cursor:
                     async with conn.transaction():
@@ -537,15 +520,61 @@ class Worker:
                                     for update in pending_updates
                                 ],
                             )
-                        except Exception:
-                            # If we were unable to apply the updates, we should
-                            # re-queue them for the next poll.
+                            return
+                        except DeadlockDetected:
+                            if attempt == 0:
+                                self.chancy.log.error(
+                                    "Deadlock detected while updating"
+                                    f" {len(pending_updates)} jobs,"
+                                    " retrying once."
+                                )
+                                continue
+
                             self.chancy.log.exception(
-                                "Failed to apply updates to job instances."
+                                "Deadlock detected while updating"
+                                f" {len(pending_updates)} jobs,"
+                                " retry exhausted."
                             )
                             for update in pending_updates:
                                 await self.outgoing.put(update)
                             raise
+                        except Exception:
+                            self.chancy.log.exception(
+                                "Failed to apply updates to job"
+                                " instances."
+                            )
+                            for update in pending_updates:
+                                await self.outgoing.put(update)
+                            raise
+
+    async def _maintain_updates(self):
+        """
+        Process updates to job instances.
+
+        We maintain a queue of updates to job instances, and process them in
+        batches to significantly reduce the number of overall transactions that
+        need to be made, at the cost of potentially losing some updates if the
+        worker is stopped unexpectedly. The frequency of these updates can be
+        controlled by setting the `send_outgoing_interval` attribute on the
+        worker.
+        """
+        while True:
+            if self.outgoing.empty():
+                await asyncio.sleep(self.send_outgoing_interval)
+                continue
+
+            pending_updates = []
+            while len(pending_updates) < 1000:
+                try:
+                    pending_updates.append(self.outgoing.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            self.chancy.log.debug(
+                f"Processing {len(pending_updates)} outgoing updates."
+            )
+
+            await self._flush_updates(pending_updates)
 
             for update in pending_updates:
                 for plugin in self.chancy.plugins.values():
