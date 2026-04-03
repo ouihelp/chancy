@@ -125,6 +125,9 @@ class Worker:
     :param register_signal_handlers: Whether to register signal handlers.
     """
 
+    #: Maximum number of retries on deadlock before re-raising.
+    DEADLOCK_MAX_RETRIES = 1
+
     def __init__(
         self,
         chancy: Chancy,
@@ -497,12 +500,10 @@ class Worker:
                 f"Processing {len(pending_updates)} outgoing updates."
             )
 
-            for attempt in range(2):
+            for attempt in range(self.DEADLOCK_MAX_RETRIES + 1):
                 try:
                     async with self.chancy.pool.connection() as conn:
-                        async with conn.cursor(
-                            row_factory=dict_row
-                        ) as cursor:
+                        async with conn.cursor(row_factory=dict_row) as cursor:
                             async with conn.transaction():
                                 await cursor.executemany(
                                     sql.SQL(
@@ -549,7 +550,7 @@ class Worker:
                                 )
                     break
                 except DeadlockDetected:
-                    if attempt < 1:
+                    if attempt < self.DEADLOCK_MAX_RETRIES:
                         self.chancy.log.error(
                             "Deadlock detected while updating"
                             f" {len(pending_updates)} jobs,"
