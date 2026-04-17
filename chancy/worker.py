@@ -496,6 +496,12 @@ class Worker:
                 except asyncio.QueueEmpty:
                     break
 
+            # Lock ordering: sort by unique_key so concurrent push_many_ex
+            # transactions acquire row locks in the same order and cannot
+            # deadlock. Jobs without a unique_key cannot collide via
+            # ON CONFLICT so grouping them first is safe.
+            pending_updates.sort(key=lambda u: (u.unique_key or "", u.id))
+
             self.chancy.log.debug(
                 f"Processing {len(pending_updates)} outgoing updates."
             )
