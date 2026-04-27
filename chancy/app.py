@@ -678,7 +678,7 @@ class Chancy:
         # UPDATE transactions acquire row locks in the same order and cannot
         # deadlock (see CAP-1073). References are returned in the caller's
         # original order to preserve the public API contract.
-        references: list[Reference | None] = [None] * len(jobs)
+        references_by_index: dict[int, Reference] = {}
         for original_index, job in sorted(
             enumerate(jobs), key=lambda pair: self._job_unique_key(pair[1])
         ):
@@ -687,7 +687,7 @@ class Chancy:
                 self._get_job_params(job),
             )
             record = await cursor.fetchone()
-            references[original_index] = Reference(record["id"])
+            references_by_index[original_index] = Reference(record["id"])
 
         if self.notifications:
             for queue in set(
@@ -696,7 +696,7 @@ class Chancy:
             ):
                 await self.notify(cursor, "queue.pushed", {"q": queue})
 
-        return references
+        return [references_by_index[i] for i in range(len(jobs))]
 
     def sync_push_many_ex(
         self, cursor: Cursor, jobs: list[Job]
@@ -717,7 +717,7 @@ class Chancy:
         :return: A list of references to the jobs in the queue.
         """
         # Lock ordering: see push_many_ex for rationale (CAP-1073).
-        references: list[Reference | None] = [None] * len(jobs)
+        references_by_index: dict[int, Reference] = {}
         for original_index, job in sorted(
             enumerate(jobs), key=lambda pair: self._job_unique_key(pair[1])
         ):
@@ -726,12 +726,12 @@ class Chancy:
                 self._get_job_params(job),
             )
             record = cursor.fetchone()
-            references[original_index] = Reference(record["id"])
+            references_by_index[original_index] = Reference(record["id"])
 
         for queue in set(job.queue for job in jobs):
             self.sync_notify(cursor, "queue.pushed", {"q": queue})
 
-        return references
+        return [references_by_index[i] for i in range(len(jobs))]
 
     @_ensure_pool_is_open
     async def get_job(self, ref: Reference) -> QueuedJob | None:
@@ -1259,9 +1259,8 @@ class Chancy:
 
     @staticmethod
     def _job_unique_key(job: Job | IsAJob[..., Any]) -> str:
-        if callable(job):
-            job = job.job
-        return job.unique_key or ""
+        actual = job if isinstance(job, Job) else job.job
+        return actual.unique_key or ""
 
     @staticmethod
     def _get_job_params(job: Job | IsAJob[..., Any]) -> dict:
