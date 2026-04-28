@@ -1259,8 +1259,10 @@ class Chancy:
 
     @staticmethod
     def _job_unique_key(job: Job | IsAJob[..., Any]) -> str:
+        # Coerce to str: the column is TEXT and psycopg accepts non-str values,
+        # but the in-memory sort used for lock ordering needs a uniform type.
         actual = job if isinstance(job, Job) else job.job
-        return actual.unique_key or ""
+        return str(actual.unique_key) if actual.unique_key is not None else ""
 
     @staticmethod
     def _get_job_params(job: Job | IsAJob[..., Any]) -> dict:
