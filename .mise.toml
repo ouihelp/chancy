@@ -1,0 +1,44 @@
+# Fork-local: upstream has no .mise.toml, so this file cannot conflict on a
+# sync. See FORK.md before adding anything here that upstream might also want.
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+UV_PROJECT_ENVIRONMENT = "{{ config_root }}/.venv"
+UV_PYTHON = "3.13"
+
+# AWS_PROFILE is deliberately NOT set here.
+#
+# Releasing publishes to the production account, 202878675042, and the profile
+# that grants access to it differs from person to person — pinning one in a
+# committed file would be wrong for everyone but its author. Point your profile
+# at production before releasing, either by exporting it:
+#
+#     AWS_PROFILE=<your production profile> mise run release
+#
+# or once, in a gitignored .mise.local.toml next to this file:
+#
+#     [env]
+#     AWS_PROFILE = "<your production profile>"
+#
+# Note this is the production account, not the dev/staging one you may be used
+# to on other repositories. scripts/release prints the account and role it
+# resolved to and refuses to build anything if it is not 202878675042, so a
+# wrong profile costs you a message rather than a bad release.
+
+[tools]
+python = "3.13"
+uv = "0.11.24"
+# The API plugin dashboard is built with npm as part of a release.
+node = "22"
+
+# The release logic lives in scripts/release, not inline here, so that it stays
+# runnable without mise and has a single place to be read and reviewed. These
+# tasks are just the entry point. FORK.md explains the versioning scheme.
+
+[tasks.release-check]
+description = "Rehearse a release: every check and the full build, uploads nothing"
+run = "scripts/release --dry-run"
+
+[tasks.release]
+description = "Build and publish a fork release to CodeArtifact, then tag it"
+run = "scripts/release"
