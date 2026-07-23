@@ -12,8 +12,8 @@ their releases, we do not maintain a divergent codebase.
 **Fork-specific configuration never goes into a file upstream owns.**
 
 Everything about how we version, build and distribute the fork lives in
-`scripts/release` and in this file. Both are at paths upstream has nothing at,
-so they cannot conflict on a sync.
+`scripts/release`, `.mise.toml` and this file. All three are at paths upstream
+has nothing at, so they cannot conflict on a sync.
 
 This matters more than it sounds. `pyproject.toml` and
 `.github/workflows/release.yml` are the two files upstream edits most: 18 of
@@ -28,8 +28,10 @@ Concretely, this means:
   `scripts/release` passes it with `uv publish --publish-url`.
 - We do **not** edit the CI workflows to change what they publish.
 
-Both files are currently byte-identical to upstream, and the whole fork
-packaging delta is one new file. Keep it that way.
+Both files are currently byte-identical to upstream, and the entire fork
+delta is three files upstream does not have. Keep it that way — when you need
+somewhere to put a fork setting, add it to one of those three rather than to a
+file upstream also edits.
 
 ## Versioning
 
@@ -52,9 +54,12 @@ you need to know what a given release was built from, look at the tag.
 ## Releasing
 
 ```
-scripts/release --dry-run   # every check and the full build, uploads nothing
-scripts/release             # the real thing
+mise run release-check      # every check and the full build, uploads nothing
+mise run release            # the real thing
 ```
+
+These are thin wrappers around `scripts/release --dry-run` and
+`scripts/release`, which remain runnable directly if you do not use mise.
 
 The script, in order:
 
@@ -70,11 +75,11 @@ The script, in order:
 5. Verifies the wheel declares the right version and actually contains the UI.
 6. Uploads it, then tags and pushes `v<version>`.
 
-Prerequisites: `uv`, `npm`, `git`, `python3`, and an AWS session on account
-`202878675042` whose role can publish to the `engineering-artifacts` repository
-(`codeartifact:PublishPackageVersion`). The script catches missing credentials
-and a wrong account up front, but a permissions refusal only surfaces at upload
-time, after the build.
+Prerequisites: `uv`, `npm`, `git`, `python3` — all provided by `.mise.toml` —
+and an AWS session on account `202878675042` whose role can publish to the
+`engineering-artifacts` repository (`codeartifact:PublishPackageVersion`). The
+script catches missing credentials and a wrong account up front, but a
+permissions refusal only surfaces at upload time, after the build.
 
 ### The npm step is not optional
 
@@ -83,6 +88,50 @@ time, after the build.
 what is on disk at build time. Build the wheel without running the UI build
 first and you get a valid wheel that silently ships an API plugin with no
 dashboard. `scripts/release` builds it and then asserts it landed.
+
+## Local setup: `.mise.toml`
+
+`.mise.toml` pins the toolchain and carries the release tasks. Upstream has no
+mise config, so like `scripts/release` it is ours to change freely.
+
+It pins `python`, `uv` and `node`. **`node` is there for a reason**: a release
+builds the API plugin dashboard with npm, so a machine that can `uv build` is
+not necessarily a machine that can cut a correct release. Pinning it removes
+the question.
+
+The tasks are deliberately one-liners calling `scripts/release`. The release
+logic stays in the script so it has a single place to be read and reviewed, and
+so it keeps working for anyone not using mise.
+
+### AWS_PROFILE is deliberately not set
+
+`.mise.toml` sets no AWS variables. Releasing publishes to the **production
+account, `202878675042`** — not the dev/staging account you may be used to on
+other repositories — and the profile that reaches it differs from person to
+person, so committing one would be wrong for everyone but its author.
+
+Point your profile at production before releasing, either per invocation:
+
+```bash
+AWS_PROFILE=<your production profile> mise run release
+```
+
+or once, in a `.mise.local.toml` next to `.mise.toml`:
+
+```toml
+[env]
+AWS_PROFILE = "<your production profile>"
+```
+
+**`.mise.local.toml` must never be committed.** Note that it is not listed in
+this repository's `.gitignore` and will not be: `.gitignore` is upstream's
+file, and adding a fork-only entry to it is exactly what the invariant forbids.
+Keep it out of git through your global ignore file (`~/.config/git/ignore`) or
+this clone's `.git/info/exclude`.
+
+Getting the profile wrong is cheap: `scripts/release` prints the account and
+role it resolved to, and refuses to build anything if the account is not
+`202878675042`.
 
 ## Syncing from upstream
 
@@ -146,10 +195,14 @@ Bumping a consumer is then `uv lock --upgrade-package chancy`.
 
 ### One-time AWS setup
 
-`chancy` exists on public PyPI, so CodeArtifact's origin controls must be set
-explicitly for the package before the first publish — otherwise an upstream
-ingest can block our own publishes, or serve the public package in place of
-ours:
+`chancy` exists on public PyPI, so CodeArtifact's origin controls matter here
+in a way they do not for our own packages: an upstream ingest can block our
+publishes, or serve the public package in place of ours.
+
+`0.25.0.5` was published on 2026-07-23, so publishing is clearly permitted.
+That says nothing about the *other* half — confirm `upstream=BLOCK` is actually
+set, or a future resolution could hand a consumer TkTech's `chancy` instead of
+ours. Applying it is idempotent:
 
 ```bash
 aws codeartifact put-package-origin-configuration \
