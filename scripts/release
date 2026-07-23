@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+#
+# Build and publish this fork to Ouihelp's private CodeArtifact repository.
+#
+# This is a fork-local file: upstream has nothing at this path, so it never
+# conflicts when we pull from TkTech/chancy. Everything specific to how we
+# distribute the fork lives here rather than in pyproject.toml or the CI
+# workflows, both of which upstream edits on nearly every release.
+#
+# The fork version is a fourth release segment on top of whatever upstream
+# version the tree is currently at (0.25.0 -> 0.25.0.1, 0.25.0.2, ...). It is
+# written into pyproject.toml only for the duration of the build and reverted
+# afterwards, so `version` in git stays byte-identical to upstream. The git tag
+# is what records which revision produced a published version.
+#
+# The version is always typed in by hand rather than derived, and the prompt
+# comes after we read the repository, so what you are answering is a list of
+# what is actually published. That read doubles as the check that the AWS
+# profile in this shell points at the account we mean to publish to.
+#
+# Usage:
+#   scripts/release              # build, prompt for a version, publish
+#   scripts/release --dry-run    # same checks and build, upload nothing
+#
+set -euo pipefail
+
+DOMAIN="ouihelp"
+DOMAIN_OWNER="202878675042"
+REGION="eu-west-3"
+REPOSITORY="engineering-artifacts"
+BASE_URL="https://${DOMAIN}-${DOMAIN_OWNER}.d.codeartifact.${REGION}.amazonaws.com/pypi/${REPOSITORY}"
+
+cd "$(dirname "$0")/.."
+
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) sed -n '3,24p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "error: $*" >&2; exit 1; }
+step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------------------
+step "Checking preconditions"
+
+for tool in uv npm aws git python3; do
+  command -v "$tool" >/dev/null || die "$tool is not installed"
+done
+
+# The build reverts pyproject.toml by restoring a backup. Refusing to run on a
+# dirty tree keeps that from being confused with real uncommitted work.
+[ -z "$(git status --porcelain)" ] || die "working tree is dirty, commit or stash first"
+
+UPSTREAM_VERSION="$(uv version --short)"
+
+echo "upstream version : ${UPSTREAM_VERSION}"
+echo "revision         : $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+[ "$DRY_RUN" -eq 1 ] && echo "mode             : dry run, nothing will be uploaded"
+
+# ---------------------------------------------------------------------------
+# Read what is already published
+#
+# This runs even on a dry run. Reaching the repository is how we confirm the
+# credentials in this shell belong to the account we mean to publish to, and
+# the identity is printed so it can be eyeballed before anything is uploaded.
+# ---------------------------------------------------------------------------
+step "Reading ${REPOSITORY} as the current AWS profile"
+
+IDENTITY="$(aws sts get-caller-identity --region "$REGION" \
+  --query '[Account,Arn]' --output text 2>/dev/null)" \
+  || die "no usable AWS credentials, log in first (AWS_PROFILE=${AWS_PROFILE:-unset})"
+echo "identity : ${IDENTITY}"
+
+case "$IDENTITY" in
+  "${DOMAIN_OWNER}"*) ;;
+  *) die "this profile is on another account, expected ${DOMAIN_OWNER}" ;;
+esac
+
+set +e
+PUBLISHED="$(aws codeartifact list-package-versions \
+  --domain "$DOMAIN" \
+  --domain-owner "$DOMAIN_OWNER" \
+  --repository "$REPOSITORY" \
+  --region "$REGION" \
+  --format pypi \
+  --package chancy \
+  --query 'versions[].version' \
+  --output text 2>&1)"
+LIST_RC=$?
+set -e
+
+if [ "$LIST_RC" -ne 0 ]; then
+  # A package that has never been published is the expected state for the very
+  # first release, and the call still proves we authenticated. Anything else
+  # (denied, wrong account, no such domain) is a real problem.
+  case "$PUBLISHED" in
+    *ResourceNotFoundException*)
+      echo "published: none yet, this would be the first release"
+      PUBLISHED=""
+      ;;
+    *) die "could not read the repository: ${PUBLISHED}" ;;
+  esac
+else
+  PUBLISHED="$(printf '%s' "$PUBLISHED" | tr '\t' '\n' | sort -V)"
+  echo "published:"
+  printf '%s\n' "$PUBLISHED" | tail -5 | sed 's/^/  /'
+fi
+
+# Suggested next version, from whichever is further ahead: what CodeArtifact
+# already holds, or what we have tagged locally. Only ever a hint.
+fork_segments() {
+  sed -n "s/^${UPSTREAM_VERSION}\.\([0-9]\{1,\}\)$/\1/p"
+}
+LAST="$(
+  {
+    printf '%s\n' "$PUBLISHED" | fork_segments
+    git tag --list "v${UPSTREAM_VERSION}.*" | sed 's/^v//' | fork_segments
+  } | sort -n | tail -1
+)"
+SUGGESTED="${UPSTREAM_VERSION}.$(( ${LAST:-0} + 1 ))"
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+step "Choosing the version to publish"
+
+[ -t 0 ] || die "no terminal to prompt on, this script is meant to be run by hand"
+
+while :; do
+  printf 'Version to publish (suggested %s): ' "$SUGGESTED"
+  read -r VERSION || die "aborted"
+  VERSION="$(printf '%s' "$VERSION" | tr -d '[:space:]')"
+
+  if [ -z "$VERSION" ]; then
+    echo "  a version is required, type it in full" >&2
+    continue
+  fi
+  case "$VERSION" in
+    "${UPSTREAM_VERSION}".[0-9]*) ;;
+    *)
+      echo "  must extend the tree's upstream version, ${UPSTREAM_VERSION}.<n>" >&2
+      continue
+      ;;
+  esac
+  if printf '%s\n' "$PUBLISHED" | grep -qxF "$VERSION"; then
+    echo "  ${VERSION} is already published, CodeArtifact will refuse it" >&2
+    continue
+  fi
+  break
+done
+
+TAG="v${VERSION}"
+git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && die "tag ${TAG} already exists"
+if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
+  die "tag ${TAG} already exists on origin"
+fi
+
+echo "publishing ${VERSION} (tag ${TAG})"
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+step "Building the API plugin UI"
+
+# chancy/plugins/api/dist is matched by the `dist/` rule in .gitignore, so it is
+# never committed. hatchling only bundles what is on disk at build time, and a
+# wheel built without this step is valid but ships a dashboard-less API plugin.
+(cd chancy/plugins/api/ui && npm ci --silent && npm run build)
+[ -f chancy/plugins/api/dist/index.html ] || die "UI build produced no dist/index.html"
+
+step "Building the wheel as ${VERSION}"
+
+rm -rf dist
+cp pyproject.toml pyproject.toml.release-backup
+restore_pyproject() {
+  if [ -f pyproject.toml.release-backup ]; then
+    mv -f pyproject.toml.release-backup pyproject.toml
+  fi
+}
+trap restore_pyproject EXIT
+
+# --frozen keeps this from re-locking: the repo has no committed uv.lock and we
+# do not want the build to leave a 200kB one behind.
+uv version --frozen "$VERSION" >/dev/null
+uv build --wheel
+restore_pyproject
+trap - EXIT
+
+[ -z "$(git status --porcelain pyproject.toml)" ] \
+  || die "pyproject.toml was not restored cleanly, inspect it before retrying"
+
+step "Verifying the wheel"
+
+WHEEL="$(ls dist/chancy-"${VERSION}"-*.whl 2>/dev/null | head -1)"
+[ -n "$WHEEL" ] || die "no wheel built for version ${VERSION}"
+
+python3 - "$WHEEL" "$VERSION" <<'PY'
+import sys, zipfile
+
+wheel, expected = sys.argv[1], sys.argv[2]
+names = zipfile.ZipFile(wheel).namelist()
+
+ui = [n for n in names if n.startswith("chancy/plugins/api/dist/")]
+if not ui:
+    sys.exit("wheel contains no API plugin UI, the npm build did not land")
+
+metadata = next(n for n in names if n.endswith(".dist-info/METADATA"))
+found = next(
+    line.split(": ", 1)[1]
+    for line in zipfile.ZipFile(wheel).read(metadata).decode().splitlines()
+    if line.startswith("Version: ")
+)
+if found != expected:
+    sys.exit(f"wheel declares version {found}, expected {expected}")
+
+print(f"  {wheel}")
+print(f"  version {found}, {len(ui)} UI files bundled")
+PY
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  step "Dry run complete, skipping upload and tag"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Publish
+# ---------------------------------------------------------------------------
+step "Publishing to CodeArtifact"
+
+TOKEN="$(aws codeartifact get-authorization-token \
+  --domain "$DOMAIN" \
+  --domain-owner "$DOMAIN_OWNER" \
+  --region "$REGION" \
+  --query authorizationToken \
+  --output text)"
+[ -n "$TOKEN" ] || die "could not obtain a CodeArtifact token"
+
+# --check-url makes a re-run after a partial failure skip what already landed
+# rather than erroring on the duplicate.
+uv publish \
+  --publish-url "${BASE_URL}/" \
+  --check-url "${BASE_URL}/simple/" \
+  --username aws \
+  --password "$TOKEN" \
+  "$WHEEL"
+
+step "Tagging ${TAG}"
+
+git tag -a "$TAG" -m "Fork release ${VERSION} (upstream ${UPSTREAM_VERSION})"
+git push origin "$TAG"
+
+step "Done"
+cat <<EOF
+
+Published chancy ${VERSION} to ${REPOSITORY}.
+
+Consumers pin it through the index, so bumping them is:
+
+    uv lock --upgrade-package chancy
+
+EOF
